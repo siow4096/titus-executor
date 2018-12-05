@@ -29,6 +29,7 @@ const (
 	FuseEnabledParam       = "titusParameter.agent.fuseEnabled"
 	assignIPv6AddressParam = "titusParameter.agent.assignIPv6Address"
 	ttyEnabledParam        = "titusParameter.agent.ttyEnabled"
+	systemdParam           = "titusParameter.agent.useSystemd"
 )
 
 const (
@@ -306,6 +307,24 @@ func (c *Container) GetTty() (bool, error) {
 		return false, nil
 	}
 	val, err := strconv.ParseBool(ttyEnabledStr)
+	if err != nil {
+		return false, err
+	}
+
+	return val, nil
+}
+
+// GetAllowNestedContainers should nested containers be allowed?
+func (c *Container) GetAllowNestedContainers() (bool, error) {
+	if c.TitusInfo.GetAllowNestedContainers() {
+		return true, nil
+	}
+
+	systemdEnabledStr, ok := c.TitusInfo.GetPassthroughAttributes()[systemdParam]
+	if !ok {
+		return false, nil
+	}
+	val, err := strconv.ParseBool(systemdEnabledStr)
 	if err != nil {
 		return false, err
 	}

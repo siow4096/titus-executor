@@ -31,6 +31,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/mount"
 	docker "github.com/docker/docker/client"
 	"github.com/docker/go-units"
 	"github.com/ftrvxmtrx/fd"
@@ -60,6 +61,8 @@ const (
 	titusEnvironments       = "/var/lib/titus-environments"
 	defaultNetworkBandwidth = 128 * MB
 	defaultKillWait         = 10 * time.Second
+	defaultRunTmpFsSize     = 64 * MiB
+	defaultRunLockTmpFsSize = 8 * MiB
 	trueString              = "true"
 	jumboFrameParam         = "titusParameter.agent.allowNetworkJumbo"
 )
@@ -454,6 +457,25 @@ func (r *DockerRuntime) dockerConfig(c *runtimeTypes.Container, binds []string, 
 
 	// Maybe set cfs bandwidth has to be called _after_
 	maybeSetCFSBandwidth(r.dockerCfg.cfsBandwidthPeriod, c, hostCfg)
+
+	// Always setup tmpfs
+	hostCfg.Tmpfs = map[string]string{
+		"/run": fmt.Sprintf("rw,noexec,nosuid,size=%d", defaultRunTmpFsSize),
+	}
+
+	if allow, _ := c.GetAllowNestedContainers(); allow {
+
+		// systemd requires `/run/lock` to be a separate mount from `/run`
+		hostCfg.Tmpfs["/run/lock"] = fmt.Sprintf("rw,noexec,nosuid,size=%d", defaultRunLockTmpFsSize)
+		hostCfg.Mounts = append(hostCfg.Mounts, mount.Mount{
+			Type:   "bind",
+			Source: "/sys/fs/cgroup",
+			Target: "/sys/fs/cgroup",
+			//Mode:     "ro",
+			ReadOnly: true,
+			// XXX ? BindOptions: ""
+		})
+	}
 
 	if r.storageOptEnabled {
 		hostCfg.StorageOpt = map[string]string{
@@ -915,14 +937,6 @@ func (r *DockerRuntime) Prepare(parentCtx context.Context, c *runtimeTypes.Conta
 	l = l.WithField("containerID", c.ID)
 	l.Info("Container successfully created")
 
-	// pushMetatron MUST be called after setting up the network driver, because it relies on
-	// c.Allocation being set
-	err = r.pushMetatron(parentCtx, c)
-	if err != nil {
-		goto error
-	}
-	l.Info("Metatron pushed")
-
 	err = r.createTitusEnvironmentFile(c)
 	if err != nil {
 		goto error
@@ -1341,6 +1355,15 @@ func (r *DockerRuntime) Start(parentCtx context.Context, c *runtimeTypes.Contain
 			ResourceID:   fmt.Sprintf("resource-eni-%d", c.Allocation.DeviceIndex-1),
 		},
 	}
+
+	// pushMetatron MUST be called after setting up the network driver, because it relies on
+	// c.Allocation being set
+	err = r.pushMetatron(ctx, c)
+	if err != nil {
+		eventCancel()
+		return "", nil, statusMessageChan, err
+	}
+	log.Info("Metatron pushed")
 
 	if r.tiniEnabled {
 		// This can block for up the the full ctx timeout

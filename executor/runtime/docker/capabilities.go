@@ -33,10 +33,13 @@ func setupAdditionalCapabilities(c *runtimeTypes.Container, hostCfg *container.H
 
 	// Privileged containers automaticaly deactivate seccomp and friends, no need to do this
 	fuseEnabled, err := c.GetFuseEnabled()
+	var allowNested bool
+
 	if err != nil {
 		return err
 	}
-	if fuseEnabled || c.TitusInfo.GetAllowNestedContainers() {
+	allowNested, _ = c.GetAllowNestedContainers()
+	if fuseEnabled || allowNested {
 		if _, ok := addedCapabilities[SYS_ADMIN]; !ok {
 			hostCfg.CapAdd = append(hostCfg.CapAdd, SYS_ADMIN)
 		}
@@ -55,7 +58,7 @@ func setupAdditionalCapabilities(c *runtimeTypes.Container, hostCfg *container.H
 
 	}
 	// We can do this here because nested containers can do everything fuse containers can
-	if c.TitusInfo.GetAllowNestedContainers() {
+	if allowNested, _ = c.GetAllowNestedContainers(); allowNested {
 		apparmorProfile = "docker-nested"
 		seccompProfile = "nested-container.json"
 

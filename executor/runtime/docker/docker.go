@@ -31,7 +31,6 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/mount"
 	docker "github.com/docker/docker/client"
 	"github.com/docker/go-units"
 	"github.com/ftrvxmtrx/fd"
@@ -57,14 +56,17 @@ const (
 const (
 	fuseDev = "/dev/fuse"
 	// See: TITUS-1231, this is added as extra padding for container initialization
-	builtInDiskBuffer       = 1100 // In megabytes, includes extra space for /logs.
-	titusEnvironments       = "/var/lib/titus-environments"
-	defaultNetworkBandwidth = 128 * MB
-	defaultKillWait         = 10 * time.Second
-	defaultRunTmpFsSize     = 64 * MiB
-	defaultRunLockTmpFsSize = 8 * MiB
-	trueString              = "true"
-	jumboFrameParam         = "titusParameter.agent.allowNetworkJumbo"
+	builtInDiskBuffer              = 1100 // In megabytes, includes extra space for /logs.
+	titusEnvironments              = "/var/lib/titus-environments"
+	defaultNetworkBandwidth        = 128 * MB
+	defaultKillWait                = 10 * time.Second
+	defaultRunTmpFsSize            = 64 * MiB
+	defaultRunLockTmpFsSize        = 8 * MiB
+	trueString                     = "true"
+	jumboFrameParam                = "titusParameter.agent.allowNetworkJumbo"
+	systemdImageLabel              = "com.netflix.titus.systemdEnabled"
+	metatronContainerRunDir        = "/titus/run/metatron"                 // In-container path to the shared metatron directory
+	metatronContainerBootstrapPath = "/titus/bin/titus-metatron-bootstrap" // In-container path to the metatron bootstrap executable
 )
 
 const envFileTemplateStr = `
@@ -209,6 +211,7 @@ type DockerRuntime struct { // nolint: golint
 	registryAuthCfg   *types.AuthConfig
 	client            *docker.Client
 	awsRegion         string
+	metatronSharedDir string
 	tiniSocketDir     string
 	tiniEnabled       bool
 	storageOptEnabled bool
@@ -252,11 +255,21 @@ func NewDockerRuntime(executorCtx context.Context, m metrics.Reporter, dockerCfg
 		return nil, err
 	}
 
+	err = setupSharedMetatronDir(dockerRuntime)
+	if err != nil {
+		return nil, err
+	}
+
 	go func() {
 		<-executorCtx.Done()
 		err = os.RemoveAll(dockerRuntime.tiniSocketDir)
 		if err != nil {
 			log.Errorf("Could not cleanup tini socket directory %s because: %v", dockerRuntime.tiniSocketDir, err)
+		}
+
+		err = os.RemoveAll(dockerRuntime.metatronSharedDir)
+		if err != nil {
+			log.WithError(err).Errorf("Could not cleanup metatron shared directory %s because: %v", dockerRuntime.metatronSharedDir, err)
 		}
 	}()
 
@@ -316,6 +329,17 @@ func setupLoggingInfra(dockerRuntime *DockerRuntime) error {
 	}
 
 	return nil
+}
+
+func setupSharedMetatronDir(dockerRuntime *DockerRuntime) error {
+	// XXX: guard this on if we're using Metatron?
+	var err error
+	dockerRuntime.metatronSharedDir, err = ioutil.TempDir("/var/tmp", "titus-executor-metatron-shared")
+	if err != nil {
+		return err
+	}
+
+	return os.Chmod(dockerRuntime.metatronSharedDir, 0700) // nolint: gosec
 }
 
 func maybeSetCFSBandwidth(cfsBandwidthPeriod uint64, c *runtimeTypes.Container, hostCfg *container.HostConfig) {
@@ -458,23 +482,14 @@ func (r *DockerRuntime) dockerConfig(c *runtimeTypes.Container, binds []string, 
 	// Maybe set cfs bandwidth has to be called _after_
 	maybeSetCFSBandwidth(r.dockerCfg.cfsBandwidthPeriod, c, hostCfg)
 
-	// Always setup tmpfs
+	// Always setup tmpfs: it's needed to ensure Metatron credentials don't persist across reboots and for SystemD to work
 	hostCfg.Tmpfs = map[string]string{
 		"/run": fmt.Sprintf("rw,noexec,nosuid,size=%d", defaultRunTmpFsSize),
 	}
 
-	if allow, _ := c.GetAllowNestedContainers(); allow {
-
+	if c.IsSystemD {
 		// systemd requires `/run/lock` to be a separate mount from `/run`
 		hostCfg.Tmpfs["/run/lock"] = fmt.Sprintf("rw,noexec,nosuid,size=%d", defaultRunLockTmpFsSize)
-		hostCfg.Mounts = append(hostCfg.Mounts, mount.Mount{
-			Type:   "bind",
-			Source: "/sys/fs/cgroup",
-			Target: "/sys/fs/cgroup",
-			//Mode:     "ro",
-			ReadOnly: true,
-			// XXX ? BindOptions: ""
-		})
 	}
 
 	if r.storageOptEnabled {
@@ -492,6 +507,11 @@ func (r *DockerRuntime) dockerConfig(c *runtimeTypes.Container, binds []string, 
 
 	// This is just factored out mutation of these objects to make the code cleaner.
 	r.setupLogs(c, containerCfg, hostCfg)
+
+	if c.GetMetatronConfig != nil {
+		hostCfg.Binds = append(hostCfg.Binds, r.metatronSharedDir+":"+metatronContainerRunDir+":ro",
+			"/apps/titus-executor/bin/titus-metatron-bootstrap:"+metatronContainerBootstrapPath+":ro")
+	}
 
 	if r.cfg.PrivilegedContainersEnabled {
 		// Note: ATM, this is used to enable MCE to use FUSE within a container and
@@ -640,6 +660,26 @@ func vpcToolPath() string {
 		panic(err)
 	}
 	return ret
+}
+
+// Use image labels to determine if it should run SystemD or not
+func setSystemdRunning(imageInfo types.ImageInspect, c *runtimeTypes.Container) error {
+	l := log.WithField("imageName", c.QualifiedImageName())
+
+	if systemdBool, ok := imageInfo.Config.Labels[systemdImageLabel]; ok {
+		val, err := strconv.ParseBool(systemdBool)
+		if err != nil {
+			return err
+		}
+
+		c.IsSystemD = val
+		l.Infof("SystemD image label set to %t", val)
+		return nil
+	}
+
+	l.Info("SystemD image label not set: not configuring container to run SystemD")
+	c.IsSystemD = false
+	return nil
 }
 
 // This will setup c.Allocation
@@ -872,7 +912,7 @@ func (r *DockerRuntime) Prepare(parentCtx context.Context, c *runtimeTypes.Conta
 		}
 
 		myImageInfo = imageInfo
-		return nil
+		return setSystemdRunning(*imageInfo, c)
 	})
 
 	if r.cfg.ContainerSSHD {
@@ -1066,7 +1106,7 @@ func metatronTarWalk(tw *tar.Writer, mcc *metatron.CredentialsConfig) error {
 }
 
 // pushMetatron adds Metatron credentials to the container
-func (r *DockerRuntime) pushMetatron(parentCtx context.Context, c *runtimeTypes.Container) error {
+func (r *DockerRuntime) pushMetatron(parentCtx context.Context, c *runtimeTypes.Container, cred *ucred) error { // nolint: gocyclo
 	if c.GetMetatronConfig == nil {
 		return nil
 	}
@@ -1086,7 +1126,7 @@ func (r *DockerRuntime) pushMetatron(parentCtx context.Context, c *runtimeTypes.
 	// TODO: Collapse these two into one tarball extract / copy, and not two
 
 	// Push trust store tar
-	if err := r.client.CopyToContainer(ctx, c.ID, "/", mcc.TruststoreTarBuf, cco); err != nil {
+	if err = r.client.CopyToContainer(ctx, c.ID, "/", mcc.TruststoreTarBuf, cco); err != nil {
 		return err
 	}
 
@@ -1096,18 +1136,60 @@ func (r *DockerRuntime) pushMetatron(parentCtx context.Context, c *runtimeTypes.
 		"taskID":    c.TaskID,
 	}).Info("Copying Metatron credentials")
 
-	tarBuf := new(bytes.Buffer)
-	tw := tar.NewWriter(tarBuf)
-	defer func() {
-		if err := tw.Close(); err != nil {
-			log.Errorf("Failed to close tar writer while creating Metatron tar: %s", err)
-		}
-	}()
-
-	if err := metatronTarWalk(tw, mcc); err != nil {
+	// Make sure that the container's root user can read this file
+	if err = os.Chown(r.metatronSharedDir, int(cred.uid), int(cred.gid)); err != nil {
 		return err
 	}
-	return r.client.CopyToContainer(ctx, c.ID, "/", tarBuf, cco)
+
+	// We can't use docker's copy mechanism, because these files need to end up in /run, which is
+	// a tmpfs mount, and docker's copy doesn't support copying onto mounted volumes. Instead, we
+	// write a file to a bind-mounted directory from the host, and then run an untar command inside
+	// the container with `titus-nsenter`
+	appTarPath := r.metatronSharedDir + "/app.tar"
+	tarFile, err := os.OpenFile(appTarPath, os.O_CREATE|os.O_WRONLY, 0400)
+	if err != nil {
+		return err
+	}
+
+	defer tarFile.Close() // nolint: errcheck
+	fileWriter := bufio.NewWriter(tarFile)
+	tarWriter := tar.NewWriter(fileWriter)
+
+	if err = metatronTarWalk(tarWriter, mcc); err != nil {
+		return err
+	}
+
+	if err = tarWriter.Close(); err != nil {
+		log.Errorf("Failed to close tar writer while creating Metatron tar: %s", err)
+		return err
+	}
+
+	if err = fileWriter.Flush(); err != nil {
+		log.Errorf("Failed to flush tar file writer while creating Metatron tar: %s", err)
+		return err
+	}
+
+	if err = tarFile.Close(); err != nil {
+		log.Errorf("Failed to close tar file while creating Metatron tar: %s", err)
+		return err
+	}
+
+	// XXX: should f.Close() here?
+	if err = os.Chown(appTarPath, int(cred.uid), int(cred.gid)); err != nil {
+		return err
+	}
+
+	// Now untar the file from within the container
+	cmd := exec.CommandContext(ctx, "/apps/titus-executor/bin/titus-nsenter", metatronContainerBootstrapPath) // nolint: gosec
+	cmd.Env = []string{
+		fmt.Sprintf("TITUS_PID_1_DIR=/var/lib/titus-inits/%s", c.TaskID),
+	}
+	stdoutStderr, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Error running metatron bootstrap: %+v: %s", err, string(stdoutStderr))
+	}
+
+	return nil
 }
 
 func (r *DockerRuntime) pushEnvironment(c *runtimeTypes.Container, imageInfo *types.ImageInspect) error { // nolint: gocyclo
@@ -1291,7 +1373,7 @@ func (r *DockerRuntime) processEFSMounts(c *runtimeTypes.Container) ([]efsMountI
 
 // Start runs an already created container. A watcher is created that monitors container state. The Status Message Channel is ONLY
 // valid if err == nil, otherwise it will block indefinitely.
-func (r *DockerRuntime) Start(parentCtx context.Context, c *runtimeTypes.Container) (string, *runtimeTypes.Details, <-chan runtimeTypes.StatusMessage, error) {
+func (r *DockerRuntime) Start(parentCtx context.Context, c *runtimeTypes.Container) (string, *runtimeTypes.Details, <-chan runtimeTypes.StatusMessage, error) { // nolint: gocyclo
 	ctx, cancel := context.WithTimeout(parentCtx, r.dockerCfg.startTimeout)
 	defer cancel()
 	var err error
@@ -1356,15 +1438,6 @@ func (r *DockerRuntime) Start(parentCtx context.Context, c *runtimeTypes.Contain
 		},
 	}
 
-	// pushMetatron MUST be called after setting up the network driver, because it relies on
-	// c.Allocation being set
-	err = r.pushMetatron(ctx, c)
-	if err != nil {
-		eventCancel()
-		return "", nil, statusMessageChan, err
-	}
-	log.Info("Metatron pushed")
-
 	if r.tiniEnabled {
 		// This can block for up the the full ctx timeout
 		logDir, containerCred, rootFile, unixConn, err := r.setupPostStartLogDirTini(ctx, listener, c)
@@ -1372,6 +1445,16 @@ func (r *DockerRuntime) Start(parentCtx context.Context, c *runtimeTypes.Contain
 			eventCancel()
 			return "", nil, statusMessageChan, err
 		}
+
+		// pushMetatron MUST be called after setting up the network driver, because it relies on
+		// c.Allocation being set
+		err = r.pushMetatron(ctx, c, containerCred)
+		if err != nil {
+			eventCancel()
+			return "", nil, statusMessageChan, err
+		}
+		log.Info("Metatron pushed")
+
 		err = r.setupEFSMounts(ctx, c, rootFile, containerCred, efsMountInfos)
 		if err != nil {
 			eventCancel()

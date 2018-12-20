@@ -85,6 +85,10 @@ var (
 		name: "titusoss/ubuntu-env-label",
 		tag:  "20180621-1529540359",
 	}
+	systemdImage = testImage{
+		name: "titusoss/ubuntu-systemd-bionic",
+		tag:  "20181219-1545261266",
+	}
 )
 
 // This file still uses log as opposed to using the testing library's built-in logging framework.
@@ -135,6 +139,9 @@ func TestStandalone(t *testing.T) {
 		testTty,
 		testTtyNegative,
 		testCachedDockerPull,
+		testRunTmpFsMount,
+		testSmallTmpFsMount,
+		testSystemdImageMount,
 	}
 	for _, fun := range testFunctions {
 		fullName := runtime.FuncForPC(reflect.ValueOf(fun).Pointer()).Name()
@@ -940,4 +947,49 @@ func testCachedDockerPull(t *testing.T, jobID string) {
 	assert.NotNil(t, res, "image should now be cached")
 	assert.Len(t, res.RepoDigests, 1, "digest should be present")
 	assert.EqualValues(t, noEntrypoint.name+"@"+noEntrypoint.digest, res.RepoDigests[0], "Correct digest should be returned")
+}
+
+// Test that `/run` is a tmpfs mount, and has the default size
+func testRunTmpFsMount(t *testing.T, jobID string) {
+	var mem int64 = 256
+	ji := &mock.JobInput{
+		ImageName:     ubuntu.name,
+		Version:       ubuntu.tag,
+		Mem:           &mem,
+		EntrypointOld: `/bin/bash -c 'findmnt -l -t tmpfs -o target,size | grep -e "/run[^/]" | grep 128M'`,
+		JobID:         jobID,
+	}
+	if !mock.RunJobExpectingSuccess(ji) {
+		t.Fail()
+	}
+}
+
+// Test if a container has a memory limit lower than the default size for `/run`, that the size of `/run` gets limited as well
+func testSmallTmpFsMount(t *testing.T, jobID string) {
+	var mem int64 = 64
+	ji := &mock.JobInput{
+		ImageName:     ubuntu.name,
+		Version:       ubuntu.tag,
+		Mem:           &mem,
+		EntrypointOld: `/bin/bash -c 'findmnt -l -t tmpfs -o target,size | grep -e "/run[^/]" | grep 64M'`,
+		JobID:         jobID,
+	}
+	if !mock.RunJobExpectingSuccess(ji) {
+		t.Fail()
+	}
+}
+
+// Test for a container running a systemd labeled image that `/run/lock` is a tmpfs mount, and has the default size
+func testSystemdImageMount(t *testing.T, jobID string) {
+	var mem int64 = 256
+	ji := &mock.JobInput{
+		ImageName:     systemdImage.name,
+		Version:       systemdImage.tag,
+		Mem:           &mem,
+		EntrypointOld: `/bin/bash -c 'findmnt -l -t tmpfs -o target,size | grep -e "/run/lock[^/]" | grep 5M'`,
+		JobID:         jobID,
+	}
+	if !mock.RunJobExpectingSuccess(ji) {
+		t.Fail()
+	}
 }

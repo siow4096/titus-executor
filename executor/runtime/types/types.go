@@ -304,11 +304,6 @@ func (c *Container) AssignIPv6Address() (bool, error) {
 
 // GetTty should the container be assigned a tty?
 func (c *Container) GetTty() (bool, error) {
-	if c.IsSystemD {
-		// SystemD will write its logs to /dev/console if it exists: do this to make debugging easier
-		return true, nil
-	}
-
 	ttyEnabledStr, ok := c.TitusInfo.GetPassthroughAttributes()[ttyEnabledParam]
 	if !ok {
 		return false, nil

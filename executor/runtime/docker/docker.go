@@ -60,11 +60,11 @@ const (
 	titusEnvironments              = "/var/lib/titus-environments"
 	defaultNetworkBandwidth        = 128 * MB
 	defaultKillWait                = 10 * time.Second
-	defaultRunTmpFsSize            = 64 * MiB
-	defaultRunLockTmpFsSize        = 8 * MiB
+	defaultRunTmpFsSize            = 128 * MiB
+	defaultRunLockTmpFsSize        = 5 * MiB // The default setting on Ubuntu Xenial
 	trueString                     = "true"
 	jumboFrameParam                = "titusParameter.agent.allowNetworkJumbo"
-	systemdImageLabel              = "com.netflix.titus.systemdEnabled"
+	systemdImageLabel              = "com.netflix.titus.systemd"
 	metatronContainerRunDir        = "/titus/run/metatron"                 // In-container path to the shared metatron directory
 	metatronContainerBootstrapPath = "/titus/bin/titus-metatron-bootstrap" // In-container path to the metatron bootstrap executable
 )
@@ -255,7 +255,7 @@ func NewDockerRuntime(executorCtx context.Context, m metrics.Reporter, dockerCfg
 		return nil, err
 	}
 
-	err = setupSharedMetatronDir(dockerRuntime)
+	err = setupSharedMetatronDir(dockerRuntime, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -267,9 +267,11 @@ func NewDockerRuntime(executorCtx context.Context, m metrics.Reporter, dockerCfg
 			log.Errorf("Could not cleanup tini socket directory %s because: %v", dockerRuntime.tiniSocketDir, err)
 		}
 
-		err = os.RemoveAll(dockerRuntime.metatronSharedDir)
-		if err != nil {
-			log.WithError(err).Errorf("Could not cleanup metatron shared directory %s because: %v", dockerRuntime.metatronSharedDir, err)
+		if cfg.MetatronEnabled {
+			err = os.RemoveAll(dockerRuntime.metatronSharedDir)
+			if err != nil {
+				log.WithError(err).Errorf("Could not cleanup metatron shared directory %s because: %v", dockerRuntime.metatronSharedDir, err)
+			}
 		}
 	}()
 
@@ -331,9 +333,14 @@ func setupLoggingInfra(dockerRuntime *DockerRuntime) error {
 	return nil
 }
 
-func setupSharedMetatronDir(dockerRuntime *DockerRuntime) error {
-	// XXX: guard this on if we're using Metatron?
+// setupSharedMetatronDir creates a tempdir to share metatron bootstrap files between the host and container
+func setupSharedMetatronDir(dockerRuntime *DockerRuntime, cfg config.Config) error {
 	var err error
+
+	if !cfg.MetatronEnabled {
+		return nil
+	}
+
 	dockerRuntime.metatronSharedDir, err = ioutil.TempDir("/var/tmp", "titus-executor-metatron-shared")
 	if err != nil {
 		return err
@@ -483,8 +490,12 @@ func (r *DockerRuntime) dockerConfig(c *runtimeTypes.Container, binds []string, 
 	maybeSetCFSBandwidth(r.dockerCfg.cfsBandwidthPeriod, c, hostCfg)
 
 	// Always setup tmpfs: it's needed to ensure Metatron credentials don't persist across reboots and for SystemD to work
+	tmpFsSize := int64(defaultRunTmpFsSize)
+	if hostCfg.Memory < tmpFsSize {
+		tmpFsSize = hostCfg.Memory
+	}
 	hostCfg.Tmpfs = map[string]string{
-		"/run": fmt.Sprintf("rw,noexec,nosuid,size=%d", defaultRunTmpFsSize),
+		"/run": fmt.Sprintf("rw,noexec,nosuid,size=%d", tmpFsSize),
 	}
 
 	if c.IsSystemD {
@@ -662,7 +673,7 @@ func vpcToolPath() string {
 	return ret
 }
 
-// Use image labels to determine if it should run SystemD or not
+// Use image labels to determine if the container should be configured to run SystemD
 func setSystemdRunning(imageInfo types.ImageInspect, c *runtimeTypes.Container) error {
 	l := log.WithField("imageName", c.QualifiedImageName())
 
@@ -1144,7 +1155,7 @@ func (r *DockerRuntime) pushMetatron(parentCtx context.Context, c *runtimeTypes.
 	// We can't use docker's copy mechanism, because these files need to end up in /run, which is
 	// a tmpfs mount, and docker's copy doesn't support copying onto mounted volumes. Instead, we
 	// write a file to a bind-mounted directory from the host, and then run an untar command inside
-	// the container with `titus-nsenter`
+	// the container's mount namespace with `titus-nsenter`
 	appTarPath := r.metatronSharedDir + "/app.tar"
 	tarFile, err := os.OpenFile(appTarPath, os.O_CREATE|os.O_WRONLY, 0400)
 	if err != nil {
@@ -1160,22 +1171,22 @@ func (r *DockerRuntime) pushMetatron(parentCtx context.Context, c *runtimeTypes.
 	}
 
 	if err = tarWriter.Close(); err != nil {
-		log.Errorf("Failed to close tar writer while creating Metatron tar: %s", err)
+		log.WithError(err).Errorf("Failed to close metatron tar writer: %s", err)
 		return err
 	}
 
 	if err = fileWriter.Flush(); err != nil {
-		log.Errorf("Failed to flush tar file writer while creating Metatron tar: %s", err)
+		log.WithError(err).Errorf("Failed to flush metatron tar file writer: %s", err)
 		return err
 	}
 
 	if err = tarFile.Close(); err != nil {
-		log.Errorf("Failed to close tar file while creating Metatron tar: %s", err)
+		log.WithError(err).Errorf("Failed to close metatron tar file: %s", err)
 		return err
 	}
 
-	// XXX: should f.Close() here?
 	if err = os.Chown(appTarPath, int(cred.uid), int(cred.gid)); err != nil {
+		log.WithError(err).Errorf("Failed to chown metatron tar file: %s", err)
 		return err
 	}
 
@@ -1186,7 +1197,8 @@ func (r *DockerRuntime) pushMetatron(parentCtx context.Context, c *runtimeTypes.
 	}
 	stdoutStderr, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Error running metatron bootstrap: %+v: %s", err, string(stdoutStderr))
+		log.WithError(err).Errorf("Error running metatron bootstrap: %+v: %s", err, string(stdoutStderr))
+		return err
 	}
 
 	return nil
@@ -1446,8 +1458,9 @@ func (r *DockerRuntime) Start(parentCtx context.Context, c *runtimeTypes.Contain
 			return "", nil, statusMessageChan, err
 		}
 
-		// pushMetatron MUST be called after setting up the network driver, because it relies on
-		// c.Allocation being set
+		// pushMetatron MUST be called after setting up the network driver (because it relies on
+		// c.Allocation being set), and after container start (because it runs an executable inside
+		// the running container)
 		err = r.pushMetatron(ctx, c, containerCred)
 		if err != nil {
 			eventCancel()

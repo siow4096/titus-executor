@@ -57,12 +57,34 @@ func (vpcService *titusVPCAgentServiceAuthFuncOverride) AuthFuncOverride(ctx con
 	if err != nil {
 		return ctx, errors.Wrap(err, "Cannot parse remote certificate")
 	}
-	_, err = cert.Verify(x509.VerifyOptions{
+	err = vpcService.validateCert(cert)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to verify client cert: %w", err)
+	}
+	return ctx, nil
+}
+
+func (vpcService *titusVPCAgentServiceAuthFuncOverride) validateCert(cert *x509.Certificate) error {
+	// This first check only validates the chain of trust
+	_, err := cert.Verify(x509.VerifyOptions{
 		Roots:     vpcService.TitusAgentCACertPool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "Unable to verify client cert")
+		return err
 	}
-	return ctx, nil
+	// The cert.Verify function is relativly limited in what it can verify.
+	// It only can take in a single string and match it against DNS/CN.
+	// We know we will need to match against a variety of incoming names,
+	// so we check everything in a loop and return an error if nothing matched.
+	if vpcService.ValidCNRegex.MatchString(cert.Subject.CommonName) {
+		return nil
+	}
+	for _, san := range cert.DNSNames {
+		if vpcService.ValidCNRegex.MatchString(san) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("Client certificate's CN: %q and SANS: %q failed to match our allow list: %s", cert.Subject.CommonName, cert.DNSNames, vpcService.ValidCNRegex.String())
 }

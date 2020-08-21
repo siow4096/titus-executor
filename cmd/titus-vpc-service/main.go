@@ -55,6 +55,7 @@ const (
 	sslPrivateKeyFlagName   = "ssl-private-key"
 	sslCAFlagName           = "ssl-ca"
 	sslTitusAgentCAFlagName = "ssl-titusagent-ca"
+	sslValidCNRegexFlagName = "ssl-valid-cn-regex"
 
 	enabledLongLivedTasksFlagName = "enabled-long-lived-tasks"
 	enabledTaskLoopsFlagName      = "enabled-task-loops"
@@ -267,6 +268,7 @@ func main() {
 				RefreshInterval:       v.GetDuration(refreshIntervalFlagName),
 				TLSConfig:             tlsConfig,
 				TitusAgentCACertPool:  titusAgentCACertPool,
+				ValidCNRegex:          v.GetString(sslValidCNRegexFlagName),
 
 				EnabledLongLivedTasks: v.GetStringSlice(enabledLongLivedTasksFlagName),
 				EnabledTaskLoops:      v.GetStringSlice(enabledTaskLoopsFlagName),
@@ -290,6 +292,7 @@ func main() {
 	rootCmd.Flags().String(sslCertFlagName, "", "The SSL Certificate")
 	rootCmd.Flags().String(sslCAFlagName, "", "General SSL CA")
 	rootCmd.Flags().String(sslTitusAgentCAFlagName, "", "Titus Agent CA")
+	rootCmd.Flags().String(sslValidCNRegexFlagName, `titusagent\..*`, "A regex representing valid CNs/SANS for incoming client certs")
 	rootCmd.Flags().Duration(gcTimeoutFlagName, 2*time.Minute, "How long must an IP be idle before we reclaim it")
 	rootCmd.Flags().Duration("reconcile-interval", 5*time.Minute, "How often to reconcile")
 	rootCmd.Flags().Duration(refreshIntervalFlagName, 60*time.Second, "How often to refresh IPs")
@@ -371,6 +374,10 @@ func bindVariables(v *pkgviper.Viper) {
 	}
 
 	if err := v.BindEnv(sslTitusAgentCAFlagName, "SSL_TITUSAGENT_CA"); err != nil {
+		panic(err)
+	}
+
+	if err := v.BindEnv(sslValidCNRegexFlagName, "SSL_VALID_CN_REGEX"); err != nil {
 		panic(err)
 	}
 

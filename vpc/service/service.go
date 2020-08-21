@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/Netflix/titus-executor/vpc/tracehelpers"
@@ -93,6 +94,7 @@ type vpcService struct {
 	refreshLock *semaphore.Weighted
 
 	TitusAgentCACertPool *x509.CertPool
+	ValidCNRegex         regexp.Regexp
 
 	dbRateLimiter *rate.Limiter
 
@@ -206,6 +208,7 @@ type Config struct {
 	RefreshInterval       time.Duration
 	TLSConfig             *tls.Config
 	TitusAgentCACertPool  *x509.CertPool
+	ValidCNRegex          string
 
 	EnabledLongLivedTasks []string
 	EnabledTaskLoops      []string
@@ -248,6 +251,12 @@ func Run(ctx context.Context, config *Config) error {
 		return errors.New("The worker role must be non-empty")
 	}
 
+	validCNRegex, err := regexp.Compile(config.ValidCNRegex)
+	if err != nil {
+		return fmt.Errorf("Error parsing ValidCN Regex: %w", err)
+	}
+	logger.G(ctx).Debugf("Will be accepting client certs that match: %s", config.ValidCNRegex)
+
 	vpc := &vpcService{
 		hostname: hostname,
 		ec2:      ec2wrapper.NewEC2SessionManager(config.WorkerRole),
@@ -260,6 +269,7 @@ func Run(ctx context.Context, config *Config) error {
 		refreshLock: semaphore.NewWeighted(config.MaxConcurrentRefresh),
 
 		TitusAgentCACertPool: config.TitusAgentCACertPool,
+		ValidCNRegex:         *validCNRegex,
 
 		dbRateLimiter: rate.NewLimiter(1000, 1),
 
